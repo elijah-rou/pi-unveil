@@ -72,18 +72,27 @@ test("separate commands inject only the selected skill and preserve existing pol
   assert.equal(f.messages.length, 2);
 });
 
-test("native skill commands activate while ordinary mentions and injected input do not", async () => {
-  const f = fixture();
-  for (const text of ["Discuss /skill:unveil-plan", "/skill:unveil-plan-extra", "unveil this", "/skill:unveil-understandx"]) {
-    assert.deepEqual(await f.input(text), { action: "continue" });
+test("native skill invocations never activate or reset extension flow", async () => {
+  for (const active of [false, true]) {
+    const f = fixture();
+    if (active) {
+      await f.command("unveil-plan", "Outer task");
+      await f.progress({ action: "point", point: "Current decision" });
+    }
+    const before = f.entries();
+    const messageCount = f.messages.length;
+    for (const idle of [true, false]) {
+      f.setIdle(idle);
+      for (const source of ["interactive", "rpc", "extension"]) {
+        for (const name of ["unveil-plan", "unveil-understand"]) {
+          assert.deepEqual(await f.input(`/skill:${name} inner task`, source), { action: "continue" });
+          assert.deepEqual(f.entries(), before);
+          assert.equal(f.messages.length, messageCount);
+        }
+      }
+    }
+    assert.deepEqual(f.notices, []);
   }
-  assert.deepEqual(await f.input("/skill:unveil-plan retries", "extension"), { action: "continue" });
-  assert.equal(f.entries().length, 0);
-  for (const source of ["interactive", "rpc"]) {
-    assert.deepEqual(await f.input("/skill:unveil-understand retries", source), { action: "continue" });
-    assert.equal(f.entries().at(-1).data.mode, "understand");
-  }
-  assert.equal(f.messages.length, 0, "native skill expansion owns the user message");
 });
 
 test("commands accept current-task default, reject excess input, and do not overwrite a busy task", async () => {
@@ -97,7 +106,7 @@ test("commands accept current-task default, reject excess input, and do not over
   f.setIdle(false);
   await f.command("unveil-understand", "a different task");
   await f.command("unveil-off");
-  assert.deepEqual(await f.input("/skill:unveil-plan new task", "interactive", "steer"), { action: "handled" });
+  assert.deepEqual(await f.input("/skill:unveil-plan new task", "interactive", "steer"), { action: "continue" });
   assert.deepEqual(await f.input("continue normally", "interactive", "followUp"), { action: "handled" });
   assert.deepEqual(f.entries(), before);
   assert.match(f.notices.at(-1).message, /current turn/i);
@@ -186,7 +195,7 @@ test("headless invocations stay inactive, while RPC uses plain status and chat",
   for (const mode of ["print", "json"]) {
     const f = fixture({ hasUI: false, mode });
     await f.command("unveil-plan", "Retries");
-    assert.deepEqual(await f.input("/skill:unveil-plan retries"), { action: "handled" });
+    assert.deepEqual(await f.input("/skill:unveil-plan retries"), { action: "continue" });
     assert.equal(await f.prompt(), undefined);
     assert.equal(f.entries().length, 0);
     assert.equal(f.messages.length, 0);
@@ -214,23 +223,29 @@ test("display text is bounded and strips terminal controls without changing stor
   assert.equal(f.entries().at(-1).data.task, task.trim());
 });
 
-test("untracked expanded skills cannot activate guidance and explicit off always leaves a revocation record", async () => {
-  for (const name of ["unveil-plan", "unveil-understand"]) {
-    const f = fixture();
-    const text = `<skill name="${name}" location="/package/skills/${name}/SKILL.md">\nReferences are relative to /package.\n\nGuide the user through everything.\n</skill>\n\nQueued task`;
-    const input = [{ role: "user", content: [{ type: "text", text }, { type: "image", data: "fixture", mimeType: "image/png" }], timestamp: 1 }];
-    const result = await f.emit("context", { messages: input });
-    assert.equal(f.entries().at(-1).data.mode, "off");
-    assert.doesNotMatch(JSON.stringify(result.messages), /Guide the user through everything/);
-    assert.match(result.messages.at(-1).content, /Unveil is off/);
-    assert.equal(result.messages[0].content[1], input[0].content[1]);
-    assert.equal(input[0].content[0].text, text, "session history is not rewritten");
+test("skill bodies and file-read results pass through unchanged in every flow state", async () => {
+  for (const flow of ["unused", "active", "off"]) {
+    for (const name of ["unveil-plan", "unveil-understand"]) {
+      const f = fixture();
+      if (flow === "active") await f.command("unveil-plan", "Outer task");
+      if (flow === "off") await f.command("unveil-off");
+      const before = f.entries();
+      const text = `<skill name="${name}" location="/package/skills/${name}/SKILL.md">\nFull skill instructions\n</skill>\n\nInner task`;
+      const messages = [
+        { role: "user", content: [{ type: "text", text }, { type: "image", data: "fixture", mimeType: "image/png" }], timestamp: 1 },
+        { role: "toolResult", toolName: "read", toolCallId: "read-skill", content: [{ type: "text", text: "Skill file body" }], isError: false, timestamp: 2 },
+      ];
+      const result = await f.emit("context", { messages });
+      assert.deepEqual(f.entries(), before);
+      if (flow === "unused") assert.equal(result, undefined);
+      else {
+        assert.deepEqual(result.messages.slice(0, messages.length), messages);
+        assert.equal(result.messages[0], messages[0], "do not rewrite native skill input");
+        assert.equal(result.messages[1], messages[1], "do not intercept skill reads");
+        if (flow === "off") assert.match(result.messages.at(-1).content, /standalone skills/i);
+      }
+    }
   }
-  const f = fixture();
-  await f.command("unveil-off");
-  assert.equal(f.entries().at(-1).data.mode, "off");
-  assert.match((await f.prompt()).systemPrompt, /Unveil is off/);
-  assert.equal(f.messages.length, 0);
 });
 
 test("per-request state revokes guidance immediately after a finish tool and never implicitly switches modes", async () => {
@@ -239,12 +254,24 @@ test("per-request state revokes guidance immediately after a finish tool and nev
   const text = '<skill name="unveil-understand" location="/package/SKILL.md">\nOther guidance\n</skill>\n\nOther task';
   const messages = [{ role: "user", content: text, timestamp: 1 }];
   const active = await f.emit("context", { messages });
-  assert.doesNotMatch(JSON.stringify(active), /Other guidance/);
+  assert.match(JSON.stringify(active), /Other guidance/);
+  assert.match(active.messages.at(-1).content, /inner skill/i);
   assert.equal(f.entries().at(-1).data.mode, "plan");
   assert.match(active.messages.at(-1).content, /Original task/);
   await f.progress({ action: "finish" });
   const inactive = await f.emit("context", { messages: [] });
   assert.match(inactive.messages.at(-1).content, /Unveil is off/);
+  assert.match(inactive.messages.at(-1).content, /standalone skills/i);
+});
+
+test("flow controls are supplied by the extension rather than the method", async () => {
+  const f = fixture();
+  await f.command("unveil-plan", "Outer task");
+  const prompt = (await f.prompt()).systemPrompt;
+  assert.match(prompt, /unveil_progress/);
+  assert.match(prompt, /outer task/i);
+  assert.match(prompt, /inner skill/i);
+  assert.match(prompt, /\/unveil-off/);
 });
 
 test("cancelled progress does not mutate state", async () => {

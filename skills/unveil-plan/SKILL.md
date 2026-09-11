@@ -10,11 +10,13 @@ Guide the user through designing the current task. Develop the reasoning togethe
 
 ## Establish the shared view
 
-Inspect the relevant instructions, implementation, tests, and settled decisions. Keep initial inspection bounded to the next design question. State the task, important constraints, and a short route through the discussion. Distinguish facts from assumptions and ask only for missing information that matters.
+Inspect the relevant instructions, implementation, tests, and settled decisions. Before proposing solutions, present a brief shared view: what problem we are solving, the evidence for it, and the observable result we want; then the current system's relevant components, responsibilities, state, and one representative dataflow. Distinguish observed behavior from assumptions and name only consequential unknowns.
+
+Keep this opening to a short problem paragraph and a compact current-system sketch, not a repository-wide tour. For a new system, show the surrounding systems and constraints instead of inventing an existing implementation. Invite questions or corrections and leave room for discussion before entering solution design, without requiring a separate approval. Expand only where needed to answer the user's questions. Reuse an already-established shared view rather than repeating the opening.
 
 Use the repository's existing planning process and artifacts. If an existing planning skill applies, retain its outcome, system-fit, program-shape, and verification requirements. This skill changes the interaction, not the planning authority or required artifacts. An existing design can still be walked through when the user wants to examine it.
 
-Completion criterion: the user can see what we are designing, what is already settled, and the first decision to discuss.
+Completion criterion: the problem, desired outcome, and relevant current behavior are visible before solution choices are introduced.
 
 ## Work one decision at a time
 
@@ -26,8 +28,6 @@ For the current consequential decision:
 4. Invite the user's questions or changes before moving on, then end the response and wait. Do not run through later decisions in the same answer. You may gather evidence needed to answer the current question before pausing.
 
 Explain first rather than withholding an answer until the user guesses. A short route map is useful; a complete design dump is not. These requested discussion points apply even when the agent could choose confidently on its own. Routine details do not each need a checkpoint.
-
-If `unveil_progress` is available, set its `point` to a short name for the current decision before discussing it. The tool updates the display; it does not itself pause the conversation.
 
 ## Follow the user's direction
 
@@ -43,6 +43,6 @@ Completion criterion: the next decision follows from the user's current directio
 
 When the guided task is complete, summarize the accepted design, remaining questions, and the next authorized action. Distinguish software verification from demonstrated understanding; assent is not evidence of competence. Do not create scores, a learning database, or new progress documents just for this interaction.
 
-Call `unveil_progress` with `action: "finish"` when available, then return to ordinary behavior. Also finish when the user says “continue normally”, asks to stop guidance, or clearly starts an unrelated task. `/unveil-off` is the deterministic exit. When ending without the progress tool, do not claim to have changed extension state; ask the user to run `/unveil-off` or say “continue normally”.
+End this guided discussion when its task is complete, the user asks to stop or says “continue normally”, or a clearly unrelated task begins. If this method was used as a helper inside a larger task, return to that caller's scope rather than declaring the outer task complete. Otherwise return to the ordinary workflow. This method needs no special commands, tools, or persistent mode state.
 
 Preserve existing authorization boundaries. Planning alone does not authorize implementation; existing implementation approval remains valid unless changed. After the requested guided checkpoints are complete, continue any already-authorized work without adding new approval gates.

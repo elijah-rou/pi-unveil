@@ -1,6 +1,8 @@
 # Session-scoped guidance
 
-Status: accepted for the initial release.
+Status: initial-release decision. Skill activation and context handling are
+superseded by [Standalone skills with optional flow support](standalone-skills.md).
+The version-1 persisted state format is unchanged.
 
 ## Context and constraints
 

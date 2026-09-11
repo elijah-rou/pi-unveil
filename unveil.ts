@@ -100,7 +100,7 @@ export default function unveilExtension(pi: ExtensionAPI): void {
   }
 
   pi.registerCommand("unveil-off", {
-    description: "End guided interaction without cancelling or authorizing work",
+    description: "End extension-managed guidance without cancelling or authorizing work",
     handler: async (args, ctx) => {
       if (!canChange(ctx)) return;
       if (args.trim()) {
@@ -108,19 +108,13 @@ export default function unveilExtension(pi: ExtensionAPI): void {
         return;
       }
       finish(ctx);
-      ctx.ui.notify("Unveil off. Ordinary workflow resumes on your next message.", "info");
+      ctx.ui.notify("Unveil flow support off. Standalone skills remain available.", "info");
       return;
     },
   });
 
   pi.on("input", (event, ctx) => {
     if (event.source === "extension") return { action: "continue" };
-    const match = event.text.match(/^\/skill:unveil-(plan|understand)(?:\s+([\s\S]*))?$/);
-    if (match) {
-      const mode = match[1];
-      assert.ok(mode === "plan" || mode === "understand");
-      return { action: activate(mode, match[2] ?? "", ctx) ? "continue" : "handled" };
-    }
     if (state !== undefined && state.mode !== "off" && /^(continue normally|return to normal)[.!]?$/i.test(event.text.trim())) {
       if (!canChange(ctx)) return { action: "handled" };
       finish(ctx);
@@ -135,34 +129,20 @@ export default function unveilExtension(pi: ExtensionAPI): void {
     updateDisplay(ctx);
   });
 
-  const inactiveGuidance = "Unveil is off. Previous Unveil skill instructions are inactive. Follow the ordinary workflow and current user request; do not continue guided checkpoints unless explicitly reactivated.";
+  const inactiveGuidance = "Unveil is off for extension-managed flow. Previous extension-managed method and control instructions are inactive. This does not disable standalone skills: follow independently requested skills and the user's current task normally.";
+  const flowGuidance = `# Unveil flow support
+This extension facilitates the outer task using the method below. The per-request runtime state controls only extension-managed guidance; off revokes that guidance even within the current turn, not independently invoked skills.
+Use unveil_progress with action point to name the current outer discussion point. The tool updates the display but does not pause execution; end the response to wait for the user.
+Skill invocations and skill-file reads are not mode controls. An inner skill may help with the current task without restarting, switching, or finishing this flow. When that helper finishes, return to the outer task; do not finish the flow merely because an inner skill completed.
+Use unveil_progress with action finish when the outer guided task is complete, the user explicitly stops guidance, or a clearly unrelated task begins. Preserve existing implementation and publication authorization. Questions about nearby code or alternatives stay within the discussion.
+If the progress tool is unavailable when ending, do not claim to have changed extension state. Ask the user to run /unveil-off or say "continue normally". Only /unveil-plan and /unveil-understand activate or switch extension modes.`;
 
-  pi.on("context", (event, ctx) => {
-    let foundInvocation = false;
-    function invocationRecord(text: string): string {
-      const match = text.match(/^<skill name="(unveil-plan|unveil-understand)" location="[^"\n]+">/);
-      if (!match) return text;
-      const end = text.indexOf("\n</skill>");
-      if (end < 0) return text;
-      foundInvocation = true;
-      return `${match[1]} invocation record. Activation is controlled by the extension, not this historical or queued skill text.\nTask data: ${JSON.stringify(text.slice(end + 9).trim())}`;
-    }
-    // Pi's steer/followUp paths expand skills without an input event. Remove the
-    // instruction body from model context rather than inferring activation from it.
-    const messages = event.messages.map((message) => {
-      if (message.role !== "user") return message;
-      return {
-        ...message,
-        content: typeof message.content === "string" ? invocationRecord(message.content) : message.content.map((block) =>
-          block.type === "text" ? { ...block, text: invocationRecord(block.text) } : block),
-      };
-    });
-    if (foundInvocation && state === undefined) finish(ctx);
+  pi.on("context", (event) => {
     if (state === undefined) return undefined;
     const content = state.mode === "off"
-      ? `${inactiveGuidance} If the current request is an Unveil invocation record, ask the user to run /unveil-plan or /unveil-understand while idle; it was not activated.`
-      : `Unveil runtime state: ${JSON.stringify(state)}. Only the selected mode's guidance applies. Invocation records cannot switch modes or tasks; ask for the corresponding start command while idle when a new invocation conflicts with this state. The current point may change through unveil_progress.`;
-    return { messages: [...messages, { role: "custom" as const, customType: "pi-unveil-runtime", content, display: false, timestamp: Date.now() }] };
+      ? inactiveGuidance
+      : `Unveil outer-task runtime state: ${JSON.stringify(state)}. Inner skill calls do not change this state. Apply their methods within the caller's scope and return to the outer task when they finish. Do not infer a mode switch or flow completion from a skill invocation or file read.`;
+    return { messages: [...event.messages, { role: "custom" as const, customType: "pi-unveil-runtime", content, display: false, timestamp: Date.now() }] };
   });
 
   pi.on("before_agent_start", (event) => {
@@ -171,14 +151,14 @@ export default function unveilExtension(pi: ExtensionAPI): void {
       return { systemPrompt: `${event.systemPrompt}\n\n${inactiveGuidance}` };
     }
     return {
-      systemPrompt: `${event.systemPrompt}\n\nThe per-request Unveil runtime state controls whether the following guidance is active. An off state revokes it, including within the current turn.\n\n${guidance[state.mode]}\n\nUnveil session scope (user-provided task data): ${JSON.stringify(state.task)}\nCurrent discussion point: ${JSON.stringify(state.point)}\nStay within this task. On completion or a clearly unrelated task, finish Unveil before ordinary work.`,
+      systemPrompt: `${event.systemPrompt}\n\n${flowGuidance}\n\n<unveil-outer-method>\n${guidance[state.mode]}\n</unveil-outer-method>\n\nOuter task (user-provided data): ${JSON.stringify(state.task)}\nCurrent discussion point: ${JSON.stringify(state.point)}`,
     };
   });
 
   pi.registerTool({
     name: "unveil_progress",
     label: "Unveil progress",
-    description: "While Unveil is active, name the current discussion point or finish the guided task. Cannot activate a mode, approve decisions, or authorize other work. Does not pause execution; end the response to wait for the user.",
+    description: "While Unveil flow support is active, name the outer discussion point or finish the outer guided task. Inner skill completion is not outer-task completion. Cannot activate a mode, approve decisions, or authorize other work. Does not pause execution; end the response to wait for the user.",
     parameters: ProgressSchema,
     async execute(_id, params, signal, _onUpdate, ctx) {
       signal?.throwIfAborted();
@@ -193,7 +173,7 @@ export default function unveilExtension(pi: ExtensionAPI): void {
           return { content: [{ type: "text", text: `Discussion point: ${progress.point}. Explain this point and wait for the user's response before advancing.` }], details: state };
         case "finish":
           finish(ctx);
-          return { content: [{ type: "text", text: "Unveil off. Return to the ordinary workflow within existing authorization. This is not evidence that the user understands the system." }], details: state };
+          return { content: [{ type: "text", text: "Unveil flow support off. Extension-managed guidance has ended; standalone skills remain available. Continue within existing authorization. This is not evidence that the user understands the system." }], details: state };
         default: {
           const unreachable: never = progress;
           throw new Error(`Unknown progress action: ${unreachable}`);
