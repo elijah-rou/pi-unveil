@@ -1,283 +1,275 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { SessionManager, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import unveil from "../unveil.ts";
 import { MAX_TASK, STATE_TYPE } from "../src/state.ts";
+import { GUIDANCE_TYPE, RECOVERY_TYPE } from "../src/guidance.ts";
 
-export function fixture({ entries = [], sessionId = "session-a", hasUI = true, mode = "tui" } = {}) {
-  const handlers = new Map();
-  const commands = new Map();
-  const tools = new Map();
-  const messages = [];
-  const notices = [];
-  const statuses = new Map();
-  const widgets = new Map();
-  let branch = [...entries];
+function fixture({ entries = [], sessionId = "session-a", hasUI = true, mode = "tui" } = {}) {
+  function manager(records) {
+    const normalized = records.map((entry, index) => ({ id: `entry-${index}`, parentId: index ? `entry-${index - 1}` : null,
+      timestamp: new Date(index).toISOString(), ...entry }));
+    return SessionManager.inMemory(process.cwd(), { id: sessionId }, normalized);
+  }
+  let sm = manager(entries);
+  const handlers = new Map(), commands = new Map(), tools = new Map();
+  const messages = [], notices = [], statuses = new Map(), widgets = new Map();
   let idle = true;
-  const ctx = {
-    hasUI, mode,
-    isIdle: () => idle,
-    sessionManager: { getBranch: () => branch, getSessionId: () => sessionId },
-    ui: {
-      notify: (message, level) => notices.push({ message, level }),
-      setStatus: (key, value) => statuses.set(key, value),
-      setWidget: (key, value) => widgets.set(key, value),
-    },
-  };
-  const api = {
-    on: (name, handler) => handlers.set(name, handler),
-    registerCommand: (name, command) => commands.set(name, command),
-    registerTool: (tool) => tools.set(tool.name, tool),
-    appendEntry: (customType, data) => branch.push({ type: "custom", customType, data: structuredClone(data) }),
-    sendUserMessage: (text, options) => messages.push({ text, options }),
-  };
-  unveil(api);
+  const ctx = { hasUI, mode, isIdle: () => idle,
+    sessionManager: { getBranch: () => sm.getBranch(), buildContextEntries: () => sm.buildContextEntries(), getSessionId: () => sessionId },
+    ui: { notify: (message, level) => notices.push({ message, level }), setStatus: (key, value) => statuses.set(key, value), setWidget: (key, value) => widgets.set(key, value) } };
+  unveil({ on: (name, handler) => handlers.set(name, handler), registerCommand: (name, command) => commands.set(name, command),
+    registerTool: (tool) => tools.set(tool.name, tool), appendEntry: (name, data) => sm.appendCustomEntry(name, structuredClone(data)),
+    sendUserMessage: (text, options) => messages.push({ text, options }) });
+  function emit(name, event = {}) { return handlers.get(name)?.(event, ctx); }
+  function context() {
+    const raw = sm.buildContextEntries().flatMap(sessionEntryToContextMessages);
+    return emit("context", { messages: raw })?.messages ?? raw;
+  }
   return {
-    ctx, commands, tools, messages, notices, statuses, widgets,
-    entries: () => structuredClone(branch),
-    setBranch: (entries) => { branch = [...entries]; },
+    ctx, commands, tools, messages, notices, statuses, widgets, emit, context,
+    entries: () => structuredClone(sm.getBranch().filter((entry) => entry.type === "custom" && entry.customType === STATE_TYPE)),
+    branch: () => structuredClone(sm.getBranch()),
+    setBranch: (records) => { sm = manager(records); },
     setIdle: (value) => { idle = value; },
-    emit: (name, event = {}) => handlers.get(name)?.(event, ctx),
     command: (name, args = "") => commands.get(name).handler(args, ctx),
-    progress: (args, signal) => tools.get("unveil_progress").execute("test-call", args, signal, undefined, ctx),
-    prompt: () => handlers.get("before_agent_start")({ systemPrompt: "Existing policy" }, ctx),
-    input: (text, source = "interactive", streamingBehavior) => handlers.get("input")({ text, source, streamingBehavior }, ctx),
+    input: (text, source = "interactive", streamingBehavior) => emit("input", { text, source, streamingBehavior }),
+    prompt() {
+      const result = emit("before_agent_start", { systemPrompt: "Existing policy" });
+      if (result.message) {
+        const m = result.message;
+        sm.appendCustomMessageEntry(m.customType, m.content, m.display, m.details);
+      }
+      return result;
+    },
+    async progress(args, signal) {
+      const result = await tools.get("unveil_progress").execute("test-call", args, signal, undefined, ctx);
+      sm.appendMessage({ role: "toolResult", toolName: "unveil_progress", toolCallId: "test-call", isError: false,
+        content: result.content, details: result.details, timestamp: 1 });
+      return result;
+    },
+    compact(keepGuidance = false) {
+      const retained = keepGuidance ? sm.getBranch().find((e) => e.type === "custom_message" && e.customType === GUIDANCE_TYPE).id
+        : sm.appendMessage({ role: "user", content: "Retained user input", timestamp: 1 });
+      const id = sm.appendCompaction("Fixture summary", retained, 1000);
+      emit("session_compact", { compactionEntry: sm.getEntry(id) });
+      return sm.getEntry(id);
+    },
   };
 }
 
-test("off by default without prompt changes, user messages, or state writes", async () => {
+const controls = (f) => f.context().filter((m) => m.role === "custom" && m.customType === GUIDANCE_TYPE);
+
+test("unused flow has only a constant bridge, no state or control messages", async () => {
   const f = fixture();
   await f.emit("session_start", { reason: "startup" });
-  assert.equal(await f.prompt(), undefined);
-  assert.deepEqual(await f.input("Rename this variable"), { action: "continue" });
-  assert.equal(f.entries().length, 0);
+  const before = f.prompt();
+  assert.ok(before.systemPrompt.startsWith("Existing policy\n"));
+  assert.equal(before.message, undefined);
+  assert.doesNotMatch(before.systemPrompt, /# Unveil (plan|understand)/);
+  assert.deepEqual(f.input("Rename this variable"), { action: "continue" });
+  assert.deepEqual(f.branch(), []);
   assert.equal(f.messages.length, 0);
   assert.equal(f.statuses.get("unveil"), undefined);
-  assert.equal(f.widgets.get("unveil"), undefined);
   await assert.rejects(() => f.progress({ action: "point", point: "Something" }), /not active/i);
 });
 
-test("separate commands inject only the selected skill and preserve existing policy", async () => {
+test("commands append selected methods once while the system prefix stays constant", async () => {
   const f = fixture();
+  const bridge = f.prompt().systemPrompt;
   for (const mode of ["plan", "understand"]) {
     await f.command(`unveil-${mode}`, "request retries");
+    const result = f.prompt();
+    assert.equal(result.systemPrompt, bridge);
+    assert.match(result.message.content, new RegExp(`# Unveil ${mode}`));
+    assert.equal(f.prompt().message, undefined);
     assert.equal(f.entries().at(-1).data.mode, mode);
-    assert.match(f.statuses.get("unveil"), new RegExp(mode));
-    const prompt = (await f.prompt()).systemPrompt;
-    assert.ok(prompt.startsWith("Existing policy\n"));
-    assert.match(prompt, new RegExp(`# Unveil ${mode}`));
-    assert.doesNotMatch(prompt, new RegExp(`# Unveil ${mode === "plan" ? "understand" : "plan"}`));
-    assert.match(prompt, /request retries/);
-    assert.equal(f.messages.at(-1).options, undefined);
+    assert.equal(f.statuses.get("unveil"), `unveil:${mode}`);
   }
+  assert.equal(controls(f).length, 2);
   assert.equal(f.messages.length, 2);
 });
 
 test("native skill invocations never activate or reset extension flow", async () => {
   for (const active of [false, true]) {
     const f = fixture();
-    if (active) {
-      await f.command("unveil-plan", "Outer task");
-      await f.progress({ action: "point", point: "Current decision" });
-    }
-    const before = f.entries();
-    const messageCount = f.messages.length;
+    if (active) { await f.command("unveil-plan", "Outer task"); f.prompt(); await f.progress({ action: "point", point: "Current decision" }); }
+    const before = f.branch();
     for (const idle of [true, false]) {
       f.setIdle(idle);
       for (const source of ["interactive", "rpc", "extension"]) {
-        for (const name of ["unveil-plan", "unveil-understand"]) {
-          assert.deepEqual(await f.input(`/skill:${name} inner task`, source), { action: "continue" });
-          assert.deepEqual(f.entries(), before);
-          assert.equal(f.messages.length, messageCount);
-        }
+        for (const name of ["unveil-plan", "unveil-understand"]) assert.deepEqual(f.input(`/skill:${name} inner task`, source), { action: "continue" });
       }
     }
+    assert.deepEqual(f.branch(), before);
     assert.deepEqual(f.notices, []);
   }
 });
 
-test("commands accept current-task default, reject excess input, and do not overwrite a busy task", async () => {
+test("invalid and busy commands cannot replace the current task", async () => {
   const f = fixture();
   await f.command("unveil-plan");
   assert.equal(f.entries().at(-1).data.task, "the current task");
   const before = f.entries();
   await f.command("unveil-understand", "a".repeat(MAX_TASK + 1));
-  assert.deepEqual(f.entries(), before);
   assert.match(f.notices.at(-1).message, /1000/);
+  await f.command("unveil-off", "extra");
+  assert.match(f.notices.at(-1).message, /Usage/);
   f.setIdle(false);
-  await f.command("unveil-understand", "a different task");
+  await f.command("unveil-understand", "new task");
   await f.command("unveil-off");
-  assert.deepEqual(await f.input("/skill:unveil-plan new task", "interactive", "steer"), { action: "continue" });
-  assert.deepEqual(await f.input("continue normally", "interactive", "followUp"), { action: "handled" });
+  assert.deepEqual(f.input("continue normally", "interactive", "followUp"), { action: "handled" });
   assert.deepEqual(f.entries(), before);
-  assert.match(f.notices.at(-1).message, /current turn/i);
 });
 
-test("progress changes the visible point, deduplicates writes, and cannot activate modes", async () => {
+test("point changes update the widget and existing tool results, not full guidance", async () => {
   const f = fixture();
   await f.command("unveil-plan", "Retries");
+  const system = f.prompt().systemPrompt;
   await f.progress({ action: "point", point: "Delivery guarantees" });
   assert.match(f.widgets.get("unveil").join("\n"), /Delivery guarantees/);
-  assert.match((await f.prompt()).systemPrompt, /Delivery guarantees/);
-  const length = f.entries().length;
+  const count = f.entries().length;
   await f.progress({ action: "point", point: "Delivery guarantees" });
-  assert.equal(f.entries().length, length);
-  await assert.rejects(() => f.progress({ action: "start", point: "New task" }));
+  assert.equal(f.entries().length, count);
+  assert.equal(f.prompt().message, undefined);
+  assert.equal(f.prompt().systemPrompt, system);
+  assert.equal(controls(f).length, 1);
+  assert.match(f.context().at(-1).content[0].text, /Delivery guarantees/);
+});
+
+test("successful finish is itself the retained exit; no repeated off packets", async () => {
+  const f = fixture();
+  await f.command("unveil-plan"); f.prompt();
   await f.progress({ action: "finish" });
   assert.equal(f.entries().at(-1).data.mode, "off");
   assert.equal(f.widgets.get("unveil"), undefined);
-  assert.match((await f.prompt()).systemPrompt, /Unveil is off/);
-  assert.doesNotMatch((await f.prompt()).systemPrompt, /# Unveil plan/);
-  await assert.rejects(() => f.progress({ action: "point", point: "New task" }), /not active/i);
-  const finished = f.entries().length;
+  assert.equal(f.prompt().message, undefined);
+  assert.equal(f.prompt().message, undefined);
+  assert.equal(controls(f).length, 1);
+  await assert.rejects(() => f.progress({ action: "point", point: "Invalid" }), /not active/i);
+  const count = f.entries().length;
   await f.progress({ action: "finish" });
-  assert.equal(f.entries().length, finished);
+  assert.equal(f.entries().length, count);
 });
 
-test("off commands and exact natural exits revoke guidance without starting another model turn", async () => {
+test("explicit and natural exits append one off control without another model turn", async () => {
   for (const exit of ["continue normally", "Return to normal.", "/unveil-off"]) {
     const f = fixture();
-    await f.command("unveil-plan", "Retries");
-    await f.input("Explain the phrase continue normally");
+    await f.command("unveil-plan"); f.prompt();
+    f.input("Explain the phrase continue normally");
     assert.equal(f.entries().at(-1).data.mode, "plan");
-    if (exit.startsWith("/")) await f.command("unveil-off");
-    else assert.deepEqual(await f.input(exit), { action: "continue" });
-    assert.equal(f.entries().at(-1).data.mode, "off");
+    if (exit.startsWith("/")) await f.command("unveil-off"); else f.input(exit);
+    assert.match(f.prompt().message.content, /Unveil is off/);
+    assert.equal(f.prompt().message, undefined);
     assert.equal(f.messages.length, 1);
-    assert.match((await f.prompt()).systemPrompt, /Unveil is off/);
   }
-  const f = fixture();
-  await f.command("unveil-plan");
-  await f.command("unveil-off", "unexpected arguments");
-  assert.equal(f.entries().at(-1).data.mode, "plan");
 });
 
-test("reload/resume and compaction retain the current branch; fork/new do not inherit", async () => {
+test("retained guidance survives reload/resume; legacy states acquire one control", async () => {
   const f = fixture();
-  await f.command("unveil-understand", "Timeout handler");
-  await f.progress({ action: "point", point: "State after cancellation" });
-  const activeBranch = f.entries();
-  await f.emit("session_compact", {});
-  assert.match((await f.prompt()).systemPrompt, /State after cancellation/);
-  await f.emit("session_shutdown", { reason: "reload" });
-  assert.equal(f.widgets.get("unveil"), undefined);
+  await f.command("unveil-understand", "Timeout handler"); f.prompt();
+  await f.progress({ action: "point", point: "Cancellation" });
   for (const reason of ["startup", "reload", "resume"]) {
-    const restored = fixture({ entries: activeBranch });
-    await restored.emit("session_start", { reason });
-    assert.match((await restored.prompt()).systemPrompt, /State after cancellation/);
-    assert.equal(restored.entries().length, activeBranch.length);
+    const restored = fixture({ entries: f.branch() });
+    restored.emit("session_start", { reason });
+    assert.equal(restored.prompt().message, undefined);
+    assert.match(restored.widgets.get("unveil").join("\n"), /Cancellation/);
+    const legacy = fixture({ entries: f.entries() });
+    legacy.emit("session_start", { reason });
+    assert.match(legacy.prompt().message.content, /Cancellation/);
+    assert.equal(legacy.prompt().message, undefined);
   }
-  for (const reason of ["new", "fork", "startup"]) {
-    const other = fixture({ entries: activeBranch, sessionId: "session-b" });
-    await other.emit("session_start", { reason });
-    assert.match((await other.prompt()).systemPrompt, /Unveil is off/, "forked skill text must be explicitly inactive");
-  }
-  const branched = fixture({ entries: activeBranch });
-  await branched.emit("session_start", { reason: "resume" });
-  await branched.command("unveil-off");
-  branched.setBranch(activeBranch);
-  await branched.emit("session_tree", {});
-  assert.match((await branched.prompt()).systemPrompt, /State after cancellation/);
-  branched.setBranch([]);
-  await branched.emit("session_tree", {});
-  assert.equal(await branched.prompt(), undefined);
+  f.emit("session_shutdown", { reason: "reload" });
+  assert.equal(f.widgets.get("unveil"), undefined);
 });
 
-test("malformed state disables guidance instead of reviving an older mode", async () => {
-  const f = fixture({ entries: [
-    { type: "custom", customType: STATE_TYPE, data: { version: 1, sessionId: "session-a", mode: "plan", task: "retry", point: "failure" } },
-    { type: "custom", customType: STATE_TYPE, data: { version: 2 } },
-  ] });
-  await f.emit("session_start", { reason: "resume" });
-  assert.match((await f.prompt()).systemPrompt, /Unveil is off/);
-});
-
-test("headless invocations stay inactive, while RPC uses plain status and chat", async () => {
-  for (const mode of ["print", "json"]) {
-    const f = fixture({ hasUI: false, mode });
-    await f.command("unveil-plan", "Retries");
-    assert.deepEqual(await f.input("/skill:unveil-plan retries"), { action: "continue" });
-    assert.equal(await f.prompt(), undefined);
-    assert.equal(f.entries().length, 0);
-    assert.equal(f.messages.length, 0);
-    assert.match(f.notices.at(-1).message, /interactive|RPC/);
-    f.setBranch([{ type: "custom", customType: STATE_TYPE, data: { version: 1, sessionId: "session-a", mode: "plan", task: "retry", point: "failure" } }]);
-    await f.emit("session_start", { reason: "resume" });
-    assert.match((await f.prompt()).systemPrompt, /Unveil is off/, "headless resume must revoke historical guidance");
-  }
-  const f = fixture({ mode: "rpc" });
-  await f.command("unveil-understand", "Retries");
-  assert.match((await f.prompt()).systemPrompt, /# Unveil understand/);
-});
-
-test("display text is bounded and strips terminal controls without changing stored task data", async () => {
+test("fork, malformed state, and headless resume append scoped revocation once", async () => {
   const f = fixture();
-  const task = "\u001b[2J\n" + "a".repeat(500);
-  await f.command("unveil-plan", task);
-  await f.progress({ action: "point", point: "Line one\n\u001b[2Jline two" });
-  const lines = f.widgets.get("unveil");
-  assert.equal(lines.length, 2);
-  for (const line of lines) {
+  await f.command("unveil-plan", "Original"); f.prompt();
+  for (const options of [
+    { entries: f.branch(), sessionId: "fork-b" },
+    { entries: [...f.branch(), { type: "custom", customType: STATE_TYPE, data: { version: 99 } }] },
+    { entries: f.branch(), hasUI: false, mode: "print" },
+  ]) {
+    const other = fixture(options);
+    other.emit("session_start", { reason: "resume" });
+    assert.match(other.prompt().message.content, /Unveil is off/);
+    assert.equal(other.prompt().message, undefined);
+  }
+  const empty = fixture({ hasUI: false, mode: "json" });
+  await empty.command("unveil-plan");
+  assert.equal(empty.prompt().message, undefined);
+  assert.deepEqual(empty.input("/skill:unveil-plan"), { action: "continue" });
+});
+
+test("compaction records one frozen recovery and replays it at a stable summary anchor", async () => {
+  const f = fixture();
+  await f.command("unveil-plan", "Retries"); f.prompt();
+  await f.progress({ action: "point", point: "At checkpoint" });
+  const checkpoint = f.compact();
+  const records = f.branch().filter((e) => e.type === "custom" && e.customType === RECOVERY_TYPE);
+  assert.equal(records.length, 1);
+  const first = f.context();
+  assert.equal(first[0].role, "compactionSummary");
+  assert.equal(first[1].role, "user");
+  assert.match(first[2].content, /At checkpoint/);
+  assert.equal(f.prompt().message, undefined);
+  f.emit("session_compact", { compactionEntry: checkpoint });
+  assert.deepEqual(f.branch().filter((e) => e.type === "custom" && e.customType === RECOVERY_TYPE), records);
+  await f.progress({ action: "point", point: "Later point" });
+  assert.deepEqual(f.context().slice(0, first.length), first);
+  assert.match(f.widgets.get("unveil").join("\n"), /Later point/);
+  const resumed = fixture({ entries: f.branch() });
+  resumed.emit("session_start", { reason: "resume" });
+  assert.equal(resumed.prompt().message, undefined);
+  assert.deepEqual(resumed.context(), f.context());
+});
+
+test("compaction keeps an existing method instead of duplicating it", async () => {
+  const f = fixture();
+  await f.command("unveil-plan"); f.prompt();
+  f.compact(true);
+  assert.equal(f.branch().filter((e) => e.type === "custom" && e.customType === RECOVERY_TYPE).length, 0);
+  assert.equal(controls(f).length, 1);
+  assert.equal(f.prompt().message, undefined);
+});
+
+test("recovery follows older retained controls so a new mode wins without another message", async () => {
+  const f = fixture();
+  await f.command("unveil-plan", "Old task"); f.prompt();
+  await f.command("unveil-understand", "New task");
+  f.compact(true);
+  assert.equal(controls(f).length, 2);
+  assert.equal(controls(f).at(-1).details.state.mode, "understand");
+  assert.match(controls(f).at(-1).content, /New task/);
+  assert.equal(f.prompt().message, undefined);
+});
+
+test("tree navigation restores the selected branch, not another branch's control", async () => {
+  const f = fixture();
+  await f.command("unveil-plan"); f.prompt();
+  const active = f.branch();
+  await f.command("unveil-off"); f.prompt();
+  f.setBranch(active); f.emit("session_tree");
+  assert.equal(f.prompt().message, undefined);
+  assert.equal(f.statuses.get("unveil"), "unveil:plan");
+  f.setBranch([]); f.emit("session_tree");
+  assert.equal(f.prompt().message, undefined);
+  assert.equal(f.statuses.get("unveil"), undefined);
+});
+
+test("ordinary skill content is never rewritten, and displays remain bounded", async () => {
+  const f = fixture();
+  const raw = [{ role: "user", content: '<skill name="unveil-understand">inner body</skill>', timestamp: 1 }];
+  assert.equal(f.emit("context", { messages: raw }), undefined);
+  await f.command("unveil-plan", "\u001b[2J\n" + "a".repeat(500)); f.prompt();
+  assert.equal(f.emit("context", { messages: raw }), undefined);
+  await f.progress({ action: "point", point: "Line\n\u001b[2Jtwo" });
+  for (const line of f.widgets.get("unveil")) {
     assert.doesNotMatch(line, /[\u0000-\u001f\u007f-\u009f]/);
     assert.ok(line.length <= 200);
   }
-  assert.equal(f.entries().at(-1).data.task, task.trim());
-});
-
-test("skill bodies and file-read results pass through unchanged in every flow state", async () => {
-  for (const flow of ["unused", "active", "off"]) {
-    for (const name of ["unveil-plan", "unveil-understand"]) {
-      const f = fixture();
-      if (flow === "active") await f.command("unveil-plan", "Outer task");
-      if (flow === "off") await f.command("unveil-off");
-      const before = f.entries();
-      const text = `<skill name="${name}" location="/package/skills/${name}/SKILL.md">\nFull skill instructions\n</skill>\n\nInner task`;
-      const messages = [
-        { role: "user", content: [{ type: "text", text }, { type: "image", data: "fixture", mimeType: "image/png" }], timestamp: 1 },
-        { role: "toolResult", toolName: "read", toolCallId: "read-skill", content: [{ type: "text", text: "Skill file body" }], isError: false, timestamp: 2 },
-      ];
-      const result = await f.emit("context", { messages });
-      assert.deepEqual(f.entries(), before);
-      if (flow === "unused") assert.equal(result, undefined);
-      else {
-        assert.deepEqual(result.messages.slice(0, messages.length), messages);
-        assert.equal(result.messages[0], messages[0], "do not rewrite native skill input");
-        assert.equal(result.messages[1], messages[1], "do not intercept skill reads");
-        if (flow === "off") assert.match(result.messages.at(-1).content, /standalone skills/i);
-      }
-    }
-  }
-});
-
-test("per-request state revokes guidance immediately after a finish tool and never implicitly switches modes", async () => {
-  const f = fixture();
-  await f.command("unveil-plan", "Original task");
-  const text = '<skill name="unveil-understand" location="/package/SKILL.md">\nOther guidance\n</skill>\n\nOther task';
-  const messages = [{ role: "user", content: text, timestamp: 1 }];
-  const active = await f.emit("context", { messages });
-  assert.match(JSON.stringify(active), /Other guidance/);
-  assert.match(active.messages.at(-1).content, /inner skill/i);
-  assert.equal(f.entries().at(-1).data.mode, "plan");
-  assert.match(active.messages.at(-1).content, /Original task/);
-  await f.progress({ action: "finish" });
-  const inactive = await f.emit("context", { messages: [] });
-  assert.match(inactive.messages.at(-1).content, /Unveil is off/);
-  assert.match(inactive.messages.at(-1).content, /standalone skills/i);
-});
-
-test("flow controls are supplied by the extension rather than the method", async () => {
-  const f = fixture();
-  await f.command("unveil-plan", "Outer task");
-  const prompt = (await f.prompt()).systemPrompt;
-  assert.match(prompt, /unveil_progress/);
-  assert.match(prompt, /outer task/i);
-  assert.match(prompt, /inner skill/i);
-  assert.match(prompt, /\/unveil-off/);
-});
-
-test("cancelled progress does not mutate state", async () => {
-  const f = fixture();
-  await f.command("unveil-plan");
-  const before = f.entries();
+  const before = f.branch();
   await assert.rejects(() => f.progress({ action: "finish" }, AbortSignal.abort()));
-  assert.deepEqual(f.entries(), before);
+  assert.deepEqual(f.branch(), before);
 });

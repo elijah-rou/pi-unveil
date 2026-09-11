@@ -85,14 +85,33 @@ ignoring case and an optional final period or exclamation mark. Other stop
 requests are handled conversationally by the agent. Standalone skills end through
 ordinary conversation, without needing an extension command.
 
-The agent is instructed to finish flow support when the outer guided task is complete or a
-clearly unrelated task begins. That judgment is not an automatic task classifier;
+The agent is instructed to finish flow support when the outer guided task is
+complete or a clearly unrelated task begins. That judgment is not an automatic task classifier;
 use `/unveil-off` when you want a deterministic exit. Do not use `agent_end` as a
 completion signal: an agent also ends a turn when it pauses for your question.
 
 Mode state survives compaction, reload, and resuming the same session. Tree
 navigation restores the selected branch's state. New sessions and forks do not
 inherit an active mode. There is no project-wide or global mode setting.
+
+### Cache-stable guidance
+
+Since 0.2.1, Unveil adds one constant system rule. Mode, task, and point changes
+never rewrite that system prefix. Activation and mode/task changes append a
+retained control/method message on the next user turn. Point updates use existing
+tool results; a successful finish result is already an exit message. Repeated
+requests do not receive another copy of the off notice or unchanged method.
+
+If compaction drops the needed guidance, Unveil records one frozen recovery
+snapshot after the checkpoint's retained messages. It replays that snapshot at
+the same position on subsequent requests, including within a tool loop. Resume
+and reload reuse retained guidance; missing or outdated methods get a new message
+rather than edits to history.
+
+Updating the extension or compacting history can rebuild the prompt prefix.
+Other extensions and provider eviction/routing can still cause cache misses.
+Stable Unveil prefixes are not a guarantee of cache hits, savings, or actual
+charges, and this extension does not change cache-retention settings.
 
 The extension supports TUI and RPC sessions using ordinary chat and status APIs.
 Print/JSON invocations cannot activate flow support; standalone skills remain
@@ -105,8 +124,8 @@ The extension keeps mode guidance available, but the model still chooses the
 explanations and discussion points. Pauses are instructions, not an execution
 gate. The agent-callable `unveil_progress` tool updates the displayed point or
 finishes the outer guided task; inner skill completion does neither. The tool
-cannot activate a mode, approve a decision, or establish
-that the user understands the system.
+cannot activate a mode, approve a decision, or establish that the user understands
+the system.
 
 Existing planning, verification, and authorization rules remain in effect.
 Understanding mode asks for read-only exploration, but **Unveil is not a sandbox**
@@ -114,9 +133,9 @@ and does not block tools. Neither mode changes models, reasoning settings, tool
 permissions, or repository files. Planning does not itself authorize
 implementation or publication.
 
-Unveil makes no extra model or network requests. Its only stored data is bounded
-mode/task/point state in Pi's existing session history. It creates no learning
-profile, score, schedule, or separate memory database. Task labels are ordinary
+Unveil makes no extra model or network requests. Bounded mode/task/point state,
+control messages, and checkpoint guidance snapshots live in Pi's existing session
+history. It creates no learning profile, score, schedule, or separate memory database. Task labels are ordinary
 session data: do not put secrets in them.
 
 ## Development
@@ -134,10 +153,13 @@ the native `/skill:` entry points.
 Tests cover input boundaries, inactive behavior, mode switching, state restoration,
 exit handling, and inner/queued skill calls. Real Pi tests run the standalone skills
 both with and without the extension and exercise flow controls with an in-memory
-fixture provider. No credentials or network access are needed for the tests.
+fixture provider. Native Codex serialization tests check stable instructions and
+append-only input, and real Pi tests cover manual and mid-run compaction. No
+credentials or network access are needed for the tests.
 These checks do not establish learning effectiveness or model adherence; use a
 real design and code walkthrough to evaluate those with the user.
 
 See [the standalone-skill decision](docs/standalone-skills.md) for the current
 ownership boundary and [the original session-state decision](docs/session-state.md)
-for persistence details.
+for persistence details. [Cache-stable delivery](docs/cache-stability.md) describes
+the control-message and checkpoint formats.

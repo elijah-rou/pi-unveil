@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createAssistantMessageEventStream, InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { convertResponsesMessages } from "../node_modules/@earendil-works/pi-ai/dist/api/openai-responses-shared.js";
+import { checkpointRecovery, retainedMessages } from "../src/guidance.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const names = ["unveil-plan", "unveil-understand"];
@@ -37,6 +39,10 @@ for (const extensionEnabled of [false, true]) {
 
       const requests = [];
       const replies = [];
+      const prefixErrors = [];
+      let previousWire;
+      let nextInputTokens = 1;
+      let nextFailure;
       let pauseRequest;
       const runtime = await ModelRuntime.create({
         credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(), modelsPath: null,
@@ -47,18 +53,36 @@ for (const extensionEnabled of [false, true]) {
         models: [{ id: "fixture", name: "Fixture", reasoning: false, input: ["text"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 4096 }],
         streamSimple(model, context) {
-          requests.push({ systemPrompt: context.systemPrompt, messages: structuredClone(context.messages) });
-          const content = replies.shift() ?? [{ type: "text", text: "Fixture response. Which part would you like to discuss?" }];
-          const reason = content.some((part) => part.type === "toolCall") ? "toolUse" : "stop";
+          const wire = { instructions: context.systemPrompt, input: convertResponsesMessages(
+            { ...model, provider: "openai-codex", api: "openai-codex-responses" }, context,
+            new Set(["openai-codex"]), { includeSystemPrompt: false }),
+          };
+          const mainRequest = context.systemPrompt.startsWith("Keep existing authorization boundaries.");
+          if (mainRequest) {
+            if (previousWire) {
+              if (wire.instructions !== previousWire.instructions) prefixErrors.push("instructions changed");
+              if (JSON.stringify(wire.input.slice(0, previousWire.input.length)) !== JSON.stringify(previousWire.input)) prefixErrors.push("prior input changed");
+            }
+            previousWire = structuredClone(wire);
+          }
+          requests.push({ systemPrompt: context.systemPrompt, messages: structuredClone(context.messages), wire });
+          const inputTokens = nextInputTokens;
+          nextInputTokens = 1;
+          const content = (mainRequest ? replies.shift() : undefined) ?? [{ type: "text", text: "Fixture response. Which part would you like to discuss?" }];
+          const failure = mainRequest ? nextFailure : undefined;
+          if (mainRequest) nextFailure = undefined;
+          const reason = failure ?? (content.some((part) => part.type === "toolCall") ? "toolUse" : "stop");
           const message = { role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
             stopReason: reason, timestamp: Date.now(),
-            usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+            ...(reason === "error" ? { errorMessage: "maximum context length exceeded" } : {}),
+            usage: { input: inputTokens, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: inputTokens + 1,
               cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
           const stream = createAssistantMessageEventStream();
           const pause = pauseRequest;
           pauseRequest = undefined;
           function complete() {
-            stream.push({ type: "done", reason, message });
+            if (reason === "error") stream.push({ type: "error", reason, error: message });
+            else stream.push({ type: "done", reason, message });
             stream.end();
           }
           if (pause) {
@@ -83,7 +107,11 @@ for (const extensionEnabled of [false, true]) {
       });
       const initialTools = session.getActiveToolNames();
       const initialModel = session.model;
-      const stateEntries = () => sm.getBranch().filter((entry) => entry.type === "custom");
+      const stateEntries = () => sm.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "pi-unveil-state");
+      session.subscribe((event) => { if (event.type === "compaction_end") previousWire = undefined; });
+      const controlTexts = () => requests.at(-1).messages.flatMap((message) => typeof message.content === "string"
+        ? [message.content] : message.content.filter((block) => block.type === "text").map((block) => block.text))
+        .filter((text) => text.startsWith("[Unveil flow control]"));
 
       function assertSkillReceived(name, task) {
         const request = requests.at(-1);
@@ -128,11 +156,14 @@ for (const extensionEnabled of [false, true]) {
       assert.deepEqual(stateEntries(), []);
       assert.equal(statuses.get("unveil"), undefined);
       assert.deepEqual(errors, []);
+      assert.deepEqual(prefixErrors, []);
       if (!extensionEnabled) return;
 
+      const fixedInstructions = requests.at(-1).systemPrompt;
       await command("/unveil-plan request retries");
-      assert.match(requests.at(-1).systemPrompt, /# Unveil plan/);
-      assert.match(requests.at(-1).systemPrompt, /Unveil flow support/);
+      assert.equal(requests.at(-1).systemPrompt, fixedInstructions);
+      assert.match(controlTexts().at(-1), /# Unveil plan/);
+      assert.match(controlTexts().at(-1), /Unveil flow support/);
       assert.equal(statuses.get("unveil"), "unveil:plan");
       replies.push([{ type: "toolCall", id: "point-call", name: "unveil_progress", arguments: { action: "point", point: "At-least-once delivery" } }]);
       await session.prompt("Why not retry without a queue?");
@@ -158,16 +189,65 @@ for (const extensionEnabled of [false, true]) {
       await session.compact();
       await session.prompt("Return to the outer delivery question");
       assert.ok(sm.getBranch().some((entry) => entry.type === "compaction"));
-      assert.match(requests.at(-1).systemPrompt, /At-least-once delivery/);
-      assert.match(requests.at(-1).systemPrompt, /Keep existing authorization boundaries/);
+      assert.match(controlTexts().at(-1), /At-least-once delivery/);
+      assert.equal(requests.at(-1).systemPrompt, fixedInstructions);
+      await session.prompt("A second turn after manual compaction");
+
+      // Exercise automatic compaction between the real tool result and next response.
+      const oldWindow = session.model.contextWindow;
+      session.model.contextWindow = 8192;
+      settingsManager.applyOverrides({ compaction: { enabled: true } });
+      const compactionsBefore = sm.getBranch().filter((entry) => entry.type === "compaction").length;
+      nextInputTokens = 10000;
+      replies.push([{ type: "text", text: "Fixture compaction detail. ".repeat(300) },
+        { type: "toolCall", id: "midrun-point", name: "unveil_progress", arguments: { action: "point", point: "Recovered mid-run" } }]);
+      await session.prompt("Continue through a mid-run compaction");
+      assert.ok(sm.getBranch().filter((entry) => entry.type === "compaction").length > compactionsBefore);
+      assert.deepEqual(errors, []);
+      assert.match(controlTexts().at(-1), /Recovered mid-run/);
+      assert.equal(requests.at(-1).systemPrompt, fixedInstructions);
+      session.model.contextWindow = oldWindow;
+      settingsManager.applyOverrides({ compaction: { enabled: false } });
+      await session.prompt("Check the prefix after mid-run recovery");
+      await session.prompt("Check it stays append-only");
+
+      for (const failure of ["error", "length"]) {
+        settingsManager.applyOverrides({ compaction: { enabled: true } });
+        const beforeOverflow = requests.length;
+        nextFailure = failure;
+        replies.push([{ type: "text", text: `Failed ${failure} response. `.repeat(200) }],
+          [{ type: "toolCall", id: `retry-${failure}`, name: "unveil_progress", arguments: { action: "point", point: `After ${failure} retry` } }]);
+        await session.prompt(`Exercise ${failure} compaction and retry`);
+        const retried = requests.slice(beforeOverflow).filter(r => r.systemPrompt === fixedInstructions);
+        assert.equal(retried.length, 3, "failed request, retry with a tool, and response after its result");
+        assert.ok(retried[1].messages.some(m => m.role === "user" && (typeof m.content === "string"
+          ? m.content.startsWith("[Unveil flow control]")
+          : m.content.some(c => c.type === "text" && c.text.startsWith("[Unveil flow control]")))),
+          `${failure}: guidance must already be present on the first retry`);
+        const afterTool = retried[2].messages;
+        const callIndex = afterTool.findIndex(m => m.role === "assistant" && m.content.some(c => c.type === "toolCall" && c.id === `retry-${failure}`));
+        assert.ok(callIndex >= 0);
+        assert.equal(afterTool[callIndex + 1].role, "toolResult", `${failure}: recovery must not split the tool pair`);
+        assert.equal(stateEntries().at(-1).data.point, `After ${failure} retry`);
+        const retained = sm.buildContextEntries();
+        const recovery = checkpointRecovery(retained);
+        const resumed = retainedMessages(retained);
+        assert.equal(resumed[recovery.retainedMessageCount].content, recovery.guidance.content);
+        assert.equal(resumed[recovery.retainedMessageCount + 1].stopReason, failure,
+          "resume may restore the failed entry, but it must not move the frozen guidance boundary");
+        assert.deepEqual(errors, []);
+        settingsManager.applyOverrides({ compaction: { enabled: false } });
+        await session.prompt(`Continue after ${failure} recovery`);
+      }
 
       await command("/unveil-understand retry handler");
-      assert.match(requests.at(-1).systemPrompt, /# Unveil understand/);
-      assert.doesNotMatch(requests.at(-1).systemPrompt, /# Unveil plan/);
+      assert.match(controlTexts().at(-1), /# Unveil understand/);
+      assert.doesNotMatch(controlTexts().at(-1), /# Unveil plan/);
+      assert.equal(requests.at(-1).systemPrompt, fixedInstructions);
       replies.push([{ type: "toolCall", id: "finish-call", name: "unveil_progress", arguments: { action: "finish" } }]);
       await session.prompt("Finish the outer guided task");
       assert.equal(stateEntries().at(-1).data.mode, "off");
-      assert.match(JSON.stringify(requests.at(-1).messages), /Unveil is off for extension-managed flow/);
+      assert.match(JSON.stringify(requests.at(-1).messages), /Unveil flow support off/);
 
       const beforeOff = requests.length;
       await session.prompt("/unveil-off");
@@ -177,7 +257,7 @@ for (const extensionEnabled of [false, true]) {
         const task = `after-off-direct-${name}`;
         await session.prompt(`/skill:${name} ${task}`);
         assertSkillReceived(name, task);
-        assert.match(requests.at(-1).systemPrompt, /does not disable standalone skills/);
+        assert.equal(requests.at(-1).systemPrompt, fixedInstructions);
         assert.doesNotMatch(requests.at(-1).systemPrompt, /# Unveil (plan|understand)/);
         assert.deepEqual(stateEntries(), offState);
       }
@@ -186,6 +266,7 @@ for (const extensionEnabled of [false, true]) {
       assert.equal(session.model, initialModel);
       assert.equal(session.thinkingLevel, "off");
       assert.deepEqual(errors, []);
+      assert.deepEqual(prefixErrors, [], "every non-compaction main request must extend the previous Codex input prefix");
     } finally {
       session?.dispose();
       rmSync(home, { recursive: true, force: true });

@@ -1,7 +1,9 @@
 # Standalone skills with optional flow support
 
 Status: accepted for 0.2. Supersedes the skill-activation and context-handling
-parts of [Session-scoped guidance](session-state.md).
+parts of [Session-scoped guidance](session-state.md). Version 0.2.1 replaces
+per-request delivery with [retained controls and checkpoint recovery](cache-stability.md);
+the ownership boundary below still applies.
 
 ## Context
 

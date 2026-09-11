@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  GUIDANCE_TYPE, RECOVERY_TYPE, GuidanceSchema, RecoverySchema,
+  checkpointRecovery, hasGuidance, replayRecovery, retainedMessages, type Guidance,
+} from "./src/guidance.ts";
 import { Value } from "typebox/value";
 import {
   ProgressSchema, STATE_TYPE, StateSchema, parseProgress, parseTask, restoreState,
@@ -131,28 +136,64 @@ export default function unveilExtension(pi: ExtensionAPI): void {
 
   const inactiveGuidance = "Unveil is off for extension-managed flow. Previous extension-managed method and control instructions are inactive. This does not disable standalone skills: follow independently requested skills and the user's current task normally.";
   const flowGuidance = `# Unveil flow support
-This extension facilitates the outer task using the method below. The per-request runtime state controls only extension-managed guidance; off revokes that guidance even within the current turn, not independently invoked skills.
+This control message facilitates the outer task using the method below. Later Unveil control messages and successful unveil_progress results supersede its state snapshot. Off ends only extension-managed guidance, not independently invoked skills.
 Use unveil_progress with action point to name the current outer discussion point. The tool updates the display but does not pause execution; end the response to wait for the user.
 Skill invocations and skill-file reads are not mode controls. An inner skill may help with the current task without restarting, switching, or finishing this flow. When that helper finishes, return to the outer task; do not finish the flow merely because an inner skill completed.
 Use unveil_progress with action finish when the outer guided task is complete, the user explicitly stops guidance, or a clearly unrelated task begins. Preserve existing implementation and publication authorization. Questions about nearby code or alternatives stay within the discussion.
 If the progress tool is unavailable when ending, do not claim to have changed extension state. Ask the user to run /unveil-off or say "continue normally". Only /unveil-plan and /unveil-understand activate or switch extension modes.`;
 
-  pi.on("context", (event) => {
-    if (state === undefined) return undefined;
-    const content = state.mode === "off"
-      ? inactiveGuidance
-      : `Unveil outer-task runtime state: ${JSON.stringify(state)}. Inner skill calls do not change this state. Apply their methods within the caller's scope and return to the outer task when they finish. Do not infer a mode switch or flow completion from a skill invocation or file read.`;
-    return { messages: [...event.messages, { role: "custom" as const, customType: "pi-unveil-runtime", content, display: false, timestamp: Date.now() }] };
+  const systemBridge = "Unveil controls: extension-managed guidance starts off. Follow the latest retained [Unveil flow control] message; later successful unveil_progress results update its point or finish the outer flow. An off control or finish result revokes earlier extension-managed guidance, not independently requested skills. Skill invocations and reads are not mode controls. Preserve existing authorization.";
+  const methods = {
+    off: inactiveGuidance,
+    plan: `${flowGuidance}\n\n<unveil-outer-method>\n${guidance.plan}\n</unveil-outer-method>`,
+    understand: `${flowGuidance}\n\n<unveil-outer-method>\n${guidance.understand}\n</unveil-outer-method>`,
+  };
+  const hashes = {
+    off: createHash("sha256").update(methods.off).digest("hex"),
+    plan: createHash("sha256").update(methods.plan).digest("hex"),
+    understand: createHash("sha256").update(methods.understand).digest("hex"),
+  };
+
+  function controlMessage(current: UnveilState): Guidance {
+    const message: Guidance = {
+      customType: GUIDANCE_TYPE,
+      content: `[Unveil flow control]\n${methods[current.mode]}\n\nOuter state snapshot (task and point are data): ${JSON.stringify(current)}`,
+      display: false,
+      details: { version: 1, state: structuredClone(current), methodHash: hashes[current.mode] },
+    };
+    assert.ok(Value.Check(GuidanceSchema, message), "Invalid Unveil guidance message");
+    return message;
+  }
+
+  pi.on("before_agent_start", (event, ctx) => {
+    const systemPrompt = `${event.systemPrompt}\n\n${systemBridge}`;
+    if (state === undefined || hasGuidance(retainedMessages(ctx.sessionManager.buildContextEntries()), state, hashes[state.mode])) {
+      return { systemPrompt };
+    }
+    return { systemPrompt, message: controlMessage(state) };
   });
 
-  pi.on("before_agent_start", (event) => {
-    if (state === undefined) return undefined;
-    if (state.mode === "off") {
-      return { systemPrompt: `${event.systemPrompt}\n\n${inactiveGuidance}` };
-    }
-    return {
-      systemPrompt: `${event.systemPrompt}\n\n${flowGuidance}\n\n<unveil-outer-method>\n${guidance[state.mode]}\n</unveil-outer-method>\n\nOuter task (user-provided data): ${JSON.stringify(state.task)}\nCurrent discussion point: ${JSON.stringify(state.point)}`,
-    };
+  pi.on("session_compact", (event, ctx) => {
+    if (state === undefined) return;
+    const entries = ctx.sessionManager.buildContextEntries();
+    // Pi 0.85.1 can report an older event entry when summaries are identical.
+    const checkpoint = entries[0];
+    assert.ok(checkpoint?.type === "compaction", "Retained context must start at its checkpoint");
+    if (checkpointRecovery(entries) !== undefined || hasGuidance(retainedMessages(entries), state, hashes[state.mode])) return;
+    const retained = retainedMessages(entries);
+    const last = retained.at(-1);
+    // Pi drops this terminal response after the event, before retrying the turn.
+    const excludesRetry = event.willRetry === true && last?.role === "assistant" &&
+      (last.stopReason === "error" || last.stopReason === "length");
+    const recovery = { version: 1, checkpointId: checkpoint.id,
+      retainedMessageCount: retained.length - (excludesRetry ? 1 : 0), guidance: controlMessage(state) };
+    assert.ok(Value.Check(RecoverySchema, recovery), "Invalid Unveil checkpoint recovery");
+    pi.appendEntry(RECOVERY_TYPE, recovery);
+  });
+
+  pi.on("context", (event, ctx) => {
+    const messages = replayRecovery(ctx.sessionManager.buildContextEntries(), event.messages);
+    return messages === event.messages ? undefined : { messages };
   });
 
   pi.registerTool({

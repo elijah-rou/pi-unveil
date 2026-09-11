@@ -1,6 +1,6 @@
 {
   "name": "pi-unveil",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Opt-in guided planning and code exploration for Pi",
   "type": "module",
   "license": "MIT",
