@@ -17,7 +17,7 @@ Implement and publish the agreed refinements, update the bootstrap package pin a
 |---|---|---|
 | Separate methods from flow controls | 22 passing tests; real Pi standalone/queued/inner invocation tests with unique per-invocation markers; Node 22.18 and 26 | complete |
 | Brief orientation and documentation | Skill discovery, two focused source reviews, isolated package archive loading | complete |
-| Delivery | Strict typecheck passed; publish package, run default repository validators, update immutable pins and local installation | in progress |
+| Delivery | Published and installed `615bd0c` (0.2.0); bootstrap runtime `1c393f1`, launcher `1af73a1`, workstation pin `a16ffde`; default repository validators and Linux/macOS package CI passed | complete |
 
 Tests preserve raw skill content, mode/task/point state across inner calls, per-request finish revocation, compaction and session isolation. Source review found a test-evidence ambiguity: queued calls could match an earlier skill body in history. Each invocation now has a unique marker checked together with its full body. No runtime or method-contract defect was established in the focused reviews.
 
